@@ -50,6 +50,10 @@ def validate_settings(raw):
     for key in ('face_mode', 'content_mode', 'ad_mode'):
         if result[key] not in ('crop', 'fit'):
             raise ValueError('Неизвестный режим заполнения.')
+    for key, default in [('ad_x', 50), ('ad_y', 72)]:
+        result[key] = float(raw.get(key, default))
+        if not math.isfinite(result[key]) or not 0 <= result[key] <= 100:
+            raise ValueError('Положение баннера должно быть от 0 до 100%.')
     for key in ('title_top', 'title_bottom'):
         value = raw.get(key, '')
         if not isinstance(value, str) or len(value) > 80 or any(ord(c) < 32 for c in value):
@@ -124,7 +128,8 @@ def command(source, ad, settings, start, duration, output, title_path=None):
             banner_filter = (fit_filter(bw, bh, 'crop') if settings['ad_mode'] == 'crop' else
                              f'scale={bw}:{bh}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1')
             filters += [prefix + ',' + banner_filter + f'[banner{i}]',
-                        f'[basebg][banner{i}]overlay=x=(W-w)/2:y=H*0.72-h/2:shortest=1[base{i}]']
+                        f'[basebg][banner{i}]overlay=x=\'max(0,min(W-w,W*{settings.get("ad_x", 50)/100}-w/2))\':'
+                        f'y=\'max(0,min(H-h,H*{settings.get("ad_y", 72)/100}-h/2))\':shortest=1[base{i}]']
         filters += [f'[base{i}][title{i}]overlay=shortest=1,format=yuv420p[v{i}]' if title_path else f'[base{i}]null[v{i}]']
         audio = f'[{i}:a:0]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,apad' if media['audio'] else 'anullsrc=r=48000:cl=stereo'
         filters += [audio + f',atrim=duration={length:.9f},asetpts=PTS-STARTPTS[a{i}]']

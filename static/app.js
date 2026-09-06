@@ -18,7 +18,7 @@ function syncControls() {
   for(const key of ['resolution','preset','face_share','face_mode','content_mode','ad_mode']) $(key.replaceAll('_','-')).value = state.settings[key];
   $('face-share-value').textContent = `${state.settings.face_share}%`;
   for(const key of ['title_top','title_bottom','title_size']) $(key.replaceAll('_','-')).value = state.settings[key];
-  syncCoordinates(); draw();
+  syncCoordinates(); syncBannerPosition(); draw();
 }
 function scheduleSave() {
   clearTimeout(saveTimer);
@@ -54,7 +54,7 @@ function mediaInfo(role, info) {
     $('source-duration').textContent = clock(info.duration);
     loadFrame(0);
   }
-  updateReady();
+  draw(); updateReady();
 }
 async function choose(role) {
   const button = $('pick-'+role); button.disabled = true;
@@ -92,6 +92,7 @@ function drawFit(ctx,img,rect,dx,dy,dw,dh,mode) {
   ctx.drawImage(img,sx,sy,sw,sh,dx,dy,dw,dh);
 }
 function draw() {
+  drawBannerPosition();
   $('source-empty').hidden=!!state.image; $('preview-empty').hidden=!!state.image;
   sourceCtx.clearRect(0,0,sourceCanvas.width,sourceCanvas.height);
   previewCtx.fillStyle='#080b09';previewCtx.fillRect(0,0,720,1280);
@@ -134,6 +135,65 @@ function titleCanvas() {
   });
   return canvas;
 }
+const bannerPresets = {top:20,middle:50,bottom:80};
+const bannerMarker = document.createElement('div');
+bannerMarker.className='banner-marker';
+bannerMarker.textContent='БАННЕР · ПЕРЕТАЩИТЕ';
+bannerMarker.setAttribute('aria-hidden','true');
+previewCanvas.parentElement.append(bannerMarker);
+function syncBannerPosition() {
+  for(const axis of ['x','y']) $('ad-'+axis).value=state.settings['ad_'+axis];
+  for(const [name,y] of Object.entries(bannerPresets)) {
+    $('ad-'+name).setAttribute('aria-pressed',state.settings.ad_x===50 && state.settings.ad_y===y);
+  }
+}
+function bannerGeometry() {
+  const W=Number(state.settings.resolution)||720,H=W*16/9;
+  let w=Math.floor(W/20)*18,h=Math.floor(H/20)*6;
+  if(state.banner && state.settings.ad_mode==='fit') {
+    const scale=Math.min(w/state.banner.width,h/state.banner.height);
+    w=Math.max(2,Math.floor(state.banner.width*scale/2)*2);
+    h=Math.max(2,Math.floor(state.banner.height*scale/2)*2);
+  }
+  w/=W;h/=H;
+  const x=Math.max(0,Math.min(1-w,(state.settings.ad_x??50)/100-w/2));
+  const y=Math.max(0,Math.min(1-h,(state.settings.ad_y??72)/100-h/2));
+  return {x,y,w,h};
+}
+function drawBannerPosition() {
+  const {x,y,w,h}=bannerGeometry();
+  Object.assign(bannerMarker.style,{left:`${x*100}%`,top:`${y*100}%`,width:`${w*100}%`,height:`${h*100}%`});
+}
+for(const [name,y] of Object.entries(bannerPresets)) $('ad-'+name).addEventListener('click',()=>{
+  state.settings.ad_x=50;state.settings.ad_y=y;syncBannerPosition();draw();scheduleSave();
+});
+for(const axis of ['x','y']) $('ad-'+axis).addEventListener('change',e=>{
+  const value=e.target.valueAsNumber;
+  if(!Number.isFinite(value)||value<0||value>100) {
+    error('Координата баннера должна быть от 0 до 100%.');syncBannerPosition();return;
+  }
+  error('');state.settings['ad_'+axis]=value;syncBannerPosition();draw();scheduleSave();
+});
+let bannerDrag=null;
+bannerMarker.addEventListener('pointerdown',e=>{
+  if(e.button!==0 || bannerDrag)return;
+  const rect=previewCanvas.getBoundingClientRect(),g=bannerGeometry();
+  bannerDrag={id:e.pointerId,rect,dx:(e.clientX-rect.left)/rect.width-g.x-g.w/2,dy:(e.clientY-rect.top)/rect.height-g.y-g.h/2,old:[state.settings.ad_x,state.settings.ad_y]};
+  clearTimeout(saveTimer);bannerMarker.setPointerCapture(e.pointerId);e.preventDefault();
+});
+bannerMarker.addEventListener('pointermove',e=>{
+  if(!bannerDrag||e.pointerId!==bannerDrag.id)return;
+  const {rect,dx,dy}=bannerDrag,g=bannerGeometry();
+  state.settings.ad_x=+(Math.max(g.w/2,Math.min(1-g.w/2,(e.clientX-rect.left)/rect.width-dx))*100).toFixed(1);
+  state.settings.ad_y=+(Math.max(g.h/2,Math.min(1-g.h/2,(e.clientY-rect.top)/rect.height-dy))*100).toFixed(1);
+  syncBannerPosition();drawBannerPosition();
+});
+function endBannerDrag(e) {
+  if(!bannerDrag||e.pointerId!==bannerDrag.id)return;
+  if(e.type==='pointercancel') [state.settings.ad_x,state.settings.ad_y]=bannerDrag.old;
+  bannerDrag=null;syncBannerPosition();drawBannerPosition();scheduleSave();
+}
+for(const event of ['pointerup','pointercancel','lostpointercapture']) bannerMarker.addEventListener(event,endBannerDrag);
 let drag=null;
 function point(e) {const r=sourceCanvas.getBoundingClientRect();return [Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))];}
 sourceCanvas.addEventListener('pointerdown',e=>{if(!state.image || e.button!==0)return;drag={start:point(e),old:[...state.settings[state.selected]]};sourceCanvas.setPointerCapture(e.pointerId);});
@@ -186,7 +246,7 @@ async function poll() {
 $('cancel').addEventListener('click',guarded(async()=>{await api('/api/cancel',{id:state.job.id});$('cancel').disabled=true;$('job-stage').textContent='Останавливаем…';}));
 $('open-output').addEventListener('click',guarded(()=>api('/api/open-folder',{id:state.job.id})));
 async function init() {
-  const data=await api('/api/state');state.token=data.token;state.settings={title_top:'',title_bottom:'',title_size:72,...data.settings};syncControls();
+  const data=await api('/api/state');state.token=data.token;state.settings={title_top:'',title_bottom:'',title_size:72,ad_x:50,ad_y:72,...data.settings};syncControls();
   $('output-path').textContent=data.output_dir;$('engine-status').textContent=data.ffmpeg?'FFmpeg готов · H.264 / AAC':'Ожидаем установку FFmpeg…';
   if(!data.ffmpeg) {
     const waitForEngine=setInterval(async()=>{

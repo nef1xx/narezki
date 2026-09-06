@@ -22,6 +22,17 @@
         <details class="coordinates"><summary>Точные координаты области <span id="selected-region">«Вебка»</span></summary><div class="coords-grid"><label>X, %<input id="rect-x" type="number" min="0" max="99" step="0.1"></label><label>Y, %<input id="rect-y" type="number" min="0" max="99" step="0.1"></label><label>Ширина, %<input id="rect-w" type="number" min="1" max="100" step="0.1"></label><label>Высота, %<input id="rect-h" type="number" min="1" max="100" step="0.1"></label></div></details>
         <div class="layout-controls"><label class="share-control" for="face-share">Высота вебки <output id="face-share-value">35%</output><input id="face-share" type="range" min="20" max="60" value="35"></label><label>Вебка<select id="face-mode"><option value="crop">Заполнить · crop</option><option value="fit">Вписать · fit</option></select></label><label>Контент<select id="content-mode"><option value="fit">Вписать · fit</option><option value="crop">Заполнить · crop</option></select></label></div>
       </section>
+      <section class="panel" aria-labelledby="banner-position-heading">
+        <div class="section-head"><h2 id="banner-position-heading">Положение баннера</h2><span class="badge">СОХРАНЯЕТСЯ</span></div>
+        <div class="segmented banner-presets" role="group" aria-label="Пресеты положения баннера">
+          <button id="ad-top" type="button" aria-pressed="false">Сверху</button><button id="ad-middle" type="button" aria-pressed="false">Посередине</button><button id="ad-bottom" type="button" aria-pressed="false">Снизу</button>
+        </div>
+        <div class="banner-coordinates">
+          <label for="ad-x">По горизонтали · X, %<input id="ad-x" type="number" min="0" max="100" step="0.1" value="50" aria-describedby="banner-position-help"></label>
+          <label for="ad-y">По вертикали · Y, %<input id="ad-y" type="number" min="0" max="100" step="0.1" value="72" aria-describedby="banner-position-help"></label>
+        </div>
+        <p id="banner-position-help" class="small muted title-help">Задайте центр баннера в процентах или перетащите его рамку в предпросмотре. У края баннер сдвигается внутрь, чтобы оставаться целиком в кадре. Рамка обозначает место рекламы и не попадает в экспорт.</p>
+      </section>
       <section class="panel title-panel" aria-labelledby="title-heading">
         <div class="section-head"><h2 id="title-heading">Текст между вебкой и видео</h2><span class="badge">ПОВЕРХ КАДРА</span></div>
         <div class="title-controls"><label for="title-top">Верхняя строка · белая<input id="title-top" type="text" maxlength="80" placeholder="ШРИФТЫ КАК У"></label><label for="title-bottom">Нижняя строка · жёлтая<input id="title-bottom" type="text" maxlength="80" placeholder="ТОП БЛОГЕРОВ"></label><label for="title-size">Размер текста<input id="title-size" type="range" min="36" max="110" value="72"></label></div>
