@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from engine import ROOT, CREATE_FLAGS, binary, command, probe, run, segments, validate_settings
+from engine import ROOT, CREATE_FLAGS, binary, clip_plan, command, hook_range, probe, run, validate_settings
 
 DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
@@ -31,7 +31,7 @@ PICKER_LOCK = threading.Lock()
 FRAME_LOCK = threading.Semaphore(2)
 MEDIA = {}
 JOBS = {}
-DEFAULT = {'settings': validate_settings({}), 'banner_path': '', 'output_dir': str(ROOT / 'exports')}
+DEFAULT = {'settings': validate_settings({}), 'banner_path': '', 'hook_path': '', 'output_dir': str(ROOT / 'exports')}
 try:
     CONFIG_DATA = {**DEFAULT, **json.loads(CONFIG.read_text(encoding='utf-8'))}
 except (OSError, ValueError):
@@ -57,13 +57,14 @@ def register(path):
 def public_job(job):
     return {k:v for k,v in job.items() if not k.startswith('_')}
 
-def render_job(job, source, ad, settings, preview):
+def render_job(job, source, ad, hook, settings, preview, plan):
     partial = None
     try:
-        plan = [(0, min(6, source['duration']))] if preview else segments(source['duration'])
-        total_time = sum(d + ad['duration'] for _,d in plan)
+        selected_hook = hook_range(hook, settings)
+        hook_duration = selected_hook[1] if selected_hook else 0
+        total_time = sum(item['duration'] + ad['duration'] + hook_duration for item in plan)
         elapsed = 0
-        for index, (start, duration) in enumerate(plan):
+        for index, clip in enumerate(plan):
             if job['_cancel'].is_set():
                 break
             job.update(stage=f'Рендер {index+1} из {len(plan)}', current=index+1)
@@ -71,7 +72,7 @@ def render_job(job, source, ad, settings, preview):
             dest = Path(job['directory']) / name
             partial = dest.with_suffix('.partial.mp4')
             title_path = Path(job['directory']) / 'title.png'
-            args = command(source, ad, settings, start, duration, partial, title_path if title_path.exists() else None)
+            args = command(source, ad, settings, clip, partial, title_path if title_path.exists() else None, hook)
             with (Path(job['directory']) / 'ffmpeg.log').open('a', encoding='utf-8') as log:
                 process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=log, text=True,
                                            encoding='utf-8', errors='replace', creationflags=CREATE_FLAGS)
@@ -83,7 +84,8 @@ def render_job(job, source, ad, settings, preview):
                     if line.startswith('out_time_us='):
                         try:
                             seconds = int(line.strip().split('=')[1]) / 1e6
-                            job['progress'] = min(99, round(100 * (elapsed + min(seconds, duration + ad['duration'])) / total_time, 1))
+                            clip_duration = clip['duration'] + ad['duration'] + hook_duration
+                            job['progress'] = min(99, round(100 * (elapsed + min(seconds, clip_duration)) / total_time, 1))
                         except ValueError:
                             pass
                 process.wait()
@@ -97,8 +99,9 @@ def render_job(job, source, ad, settings, preview):
                 raise RuntimeError('FFmpeg не смог закончить экспорт. ' + tail)
             partial.replace(dest)
             partial = None
-            elapsed += duration + ad['duration']
-            job['files'].append({'name': name, 'url': f'/output/{job["id"]}/{name}', 'duration': duration + ad['duration']})
+            clip_duration = clip['duration'] + ad['duration'] + hook_duration
+            elapsed += clip_duration
+            job['files'].append({'name': name, 'url': f'/output/{job["id"]}/{name}', 'duration': clip_duration})
         job.update(status='cancelled' if job['_cancel'].is_set() else 'done',
                    stage='Остановлено' if job['_cancel'].is_set() else 'Готово')
         if job['status'] == 'done':
@@ -141,6 +144,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/state':
                 return self.reply(200, {'app': 'cliproom', 'token': TOKEN, 'ffmpeg': bool(binary('ffmpeg') and binary('ffprobe')),
                     'settings': CONFIG_DATA['settings'], 'banner': next((m for m in MEDIA.values() if m['path'] == CONFIG_DATA['banner_path']), None),
+                    'hook': next((m for m in MEDIA.values() if m['path'] == CONFIG_DATA.get('hook_path')), None),
                     'output_dir': CONFIG_DATA['output_dir'], 'jobs': [public_job(j) for j in JOBS.values()]})
             if path.startswith('/api/jobs/'):
                 with LOCK:
@@ -171,6 +175,11 @@ class Handler(BaseHTTPRequestHandler):
                 if name not in [f['name'] for f in job['files']]:
                     raise KeyError(name)
                 return self.send_file(Path(job['directory']) / name)
+            if path == '/favicon.ico':
+                self.send_response(204)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             assets = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css'}
             if path in assets:
                 return self.send_file(ROOT / 'static' / assets[path])
@@ -206,11 +215,16 @@ class Handler(BaseHTTPRequestHandler):
                     PICKER_LOCK.release()
             if self.path == '/api/media':
                 media = register(body['path'])
-                if body.get('role') == 'banner':
+                if body.get('role') in ('banner', 'hook'):
                     with LOCK:
-                        CONFIG_DATA['banner_path'] = media['path']
+                        CONFIG_DATA[body['role'] + '_path'] = media['path']
                         save_config()
                 return self.reply(200, media)
+            if self.path == '/api/hook/clear':
+                with LOCK:
+                    CONFIG_DATA['hook_path'] = ''
+                    save_config()
+                return self.reply(200, {'ok': True})
             if self.path == '/api/settings':
                 with LOCK:
                     CONFIG_DATA['settings'] = validate_settings(body['settings'])
@@ -226,8 +240,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {'path': str(folder)})
             if self.path == '/api/render':
                 source, ad = MEDIA[body['source']], MEDIA[body['banner']]
+                hook = MEDIA[body['hook']] if body.get('hook') else None
                 settings = validate_settings(body['settings'])
                 preview = bool(body.get('preview', False))
+                plan = clip_plan(source, settings, preview)
+                hook_range(hook, settings)
                 title_png = None
                 if settings['title_top'].strip() or settings['title_bottom'].strip():
                     title_png = base64.b64decode(body.get('title_image', ''), validate=True)
@@ -246,13 +263,13 @@ class Handler(BaseHTTPRequestHandler):
                     if shutil.disk_usage(directory).free < 300 * 1024 * 1024:
                         raise ValueError('Недостаточно места: освободите хотя бы 300 МБ.')
                     job = {'id': job_id, 'status': 'running', 'progress': 0, 'stage': 'Подготовка', 'files': [],
-                           'directory': str(directory), 'preview': preview, 'total': 1 if preview else len(segments(source['duration'])),
+                           'directory': str(directory), 'preview': preview, 'total': len(plan),
                            'source_name': source['name'], '_cancel': threading.Event(), '_process': None}
                     JOBS[job_id] = job
                     CONFIG_DATA['settings'] = settings
                     save_config()
-                    (directory / 'project.json').write_text(json.dumps({'source': source, 'banner': ad, 'settings': settings}, ensure_ascii=False, indent=2), encoding='utf-8')
-                    threading.Thread(target=render_job, args=(job,source,ad,settings,preview), daemon=True).start()
+                    (directory / 'project.json').write_text(json.dumps({'source': source, 'banner': ad, 'hook': hook, 'settings': settings}, ensure_ascii=False, indent=2), encoding='utf-8')
+                    threading.Thread(target=render_job, args=(job,source,ad,hook,settings,preview,plan), daemon=True).start()
                 return self.reply(200, public_job(job))
             if self.path == '/api/cancel':
                 with LOCK:
@@ -338,6 +355,11 @@ def main():
     if CONFIG_DATA.get('banner_path'):
         try:
             register(CONFIG_DATA['banner_path'])
+        except Exception:
+            pass
+    if CONFIG_DATA.get('hook_path'):
+        try:
+            register(CONFIG_DATA['hook_path'])
         except Exception:
             pass
     try:

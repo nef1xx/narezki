@@ -42,12 +42,13 @@ def probe(path):
 def validate_settings(raw):
     result = {'resolution': str(raw.get('resolution', '720')), 'preset': raw.get('preset', 'veryfast'),
               'face_share': float(raw.get('face_share', 35)), 'face_mode': raw.get('face_mode', 'crop'),
-              'content_mode': raw.get('content_mode', 'fit'), 'ad_mode': raw.get('ad_mode', 'fit')}
+              'content_mode': raw.get('content_mode', 'fit'), 'ad_mode': raw.get('ad_mode', 'fit'),
+              'hook_mode': raw.get('hook_mode', 'crop')}
     if result['resolution'] not in ('720', '1080') or result['preset'] not in ('ultrafast', 'veryfast', 'fast'):
         raise ValueError('Неизвестный формат экспорта.')
     if not math.isfinite(result['face_share']) or not 20 <= result['face_share'] <= 60:
         raise ValueError('Высота вебки должна быть от 20 до 60%.')
-    for key in ('face_mode', 'content_mode', 'ad_mode'):
+    for key in ('face_mode', 'content_mode', 'ad_mode', 'hook_mode'):
         if result[key] not in ('crop', 'fit'):
             raise ValueError('Неизвестный режим заполнения.')
     for key, default in [('ad_x', 50), ('ad_y', 72)]:
@@ -62,6 +63,14 @@ def validate_settings(raw):
     result['title_size'] = float(raw.get('title_size', 72))
     if not math.isfinite(result['title_size']) or not 36 <= result['title_size'] <= 110:
         raise ValueError('Размер текста должен быть от 36 до 110.')
+    result['title_y'] = float(raw.get('title_y', result['face_share']))
+    if not math.isfinite(result['title_y']) or not 5 <= result['title_y'] <= 95:
+        raise ValueError('Высота текста должна быть от 5 до 95%.')
+    for key in ('source_start', 'source_end', 'cut_start', 'cut_end', 'hook_start', 'hook_end'):
+        result[key] = float(raw.get(key, 0))
+        if not math.isfinite(result[key]) or result[key] < 0:
+            raise ValueError('Временные метки не могут быть отрицательными.')
+    result['cut_enabled'] = bool(raw.get('cut_enabled', False))
     for key, default in [('face', [0, 0, .3, .3]), ('content', [0, 0, 1, 1])]:
         rect = raw.get(key, default)
         if not isinstance(rect, list) or len(rect) != 4:
@@ -74,8 +83,66 @@ def validate_settings(raw):
 
 def segments(duration):
     # Work on the output frame grid; keep even a one-frame remainder.
-    frames = max(2, math.ceil(duration * FPS - 1e-6))
+    frames = max(1, math.ceil(duration * FPS - 1e-6))
     return [(start / FPS, min(60 * FPS, frames - start) / FPS) for start in range(0, frames, 60 * FPS)]
+
+def source_ranges(duration, settings):
+    """Return retained source ranges after head/tail trimming and one optional cut."""
+    start = min(duration, settings.get('source_start', 0))
+    configured_end = settings.get('source_end', 0)
+    end = duration if configured_end <= 0 else min(duration, configured_end)
+    if end - start < 1 / FPS:
+        raise ValueError('После обрезки основного видео должен остаться хотя бы один кадр.')
+    if not settings.get('cut_enabled'):
+        return [(start, end - start)]
+    cut_start, cut_end = settings.get('cut_start', 0), settings.get('cut_end', 0)
+    if cut_start < start or cut_end > end or cut_end - cut_start < 1 / FPS:
+        raise ValueError('Вырезаемый фрагмент должен находиться внутри оставленного диапазона видео.')
+    result = []
+    if cut_start - start >= 1 / FPS:
+        result.append((start, cut_start - start))
+    if end - cut_end >= 1 / FPS:
+        result.append((cut_end, end - cut_end))
+    if not result:
+        raise ValueError('Нельзя вырезать всё основное видео целиком.')
+    return result
+
+def slice_ranges(ranges, offset, duration):
+    """Map a slice of the edited timeline back to one or more original ranges."""
+    result = []
+    remaining, skip = duration, offset
+    for source_start, source_duration in ranges:
+        if skip >= source_duration - 1e-8:
+            skip -= source_duration
+            continue
+        take = min(remaining, source_duration - skip)
+        if take > 1e-8:
+            result.append((source_start + skip, take))
+            remaining -= take
+        skip = 0
+        if remaining <= 1e-8:
+            break
+    return result
+
+def clip_plan(source, settings, preview=False):
+    retained = source_ranges(source['duration'], settings)
+    total = sum(length for _, length in retained)
+    durations = [min(6, total)] if preview else [length for _, length in segments(total)]
+    offset, result = 0, []
+    for duration in durations:
+        result.append({'ranges': slice_ranges(retained, offset, duration), 'duration': duration})
+        offset += duration
+    return result
+
+def hook_range(hook, settings):
+    if not hook:
+        return None
+    start = min(hook['duration'], settings.get('hook_start', 0))
+    configured_end = settings.get('hook_end', 0)
+    end = hook['duration'] if configured_end <= 0 else min(hook['duration'], configured_end)
+    if end - start < 1 / FPS:
+        raise ValueError('После обрезки bait-ролика должен остаться хотя бы один кадр.')
+    return start, end - start
 
 def fit_filter(width, height, mode):
     if mode == 'crop':
@@ -92,20 +159,41 @@ def crop_filter(rect, source):
     cy = min(sh - ch, int(y * sh) // 2 * 2)
     return f'crop={cw}:{ch}:{cx}:{cy}'
 
-def command(source, ad, settings, start, duration, output, title_path=None):
+def _split_ranges(ranges, position):
+    before, after, remaining = [], [], position
+    for start, duration in ranges:
+        if remaining <= 1e-8:
+            after.append((start, duration))
+        elif remaining >= duration - 1e-8:
+            before.append((start, duration))
+            remaining -= duration
+        else:
+            before.append((start, remaining))
+            after.append((start + remaining, duration - remaining))
+            remaining = 0
+    return before, after
+
+def command(source, ad, settings, clip, output, title_path=None, hook=None):
     width = int(settings['resolution'])
     height = width * 16 // 9
     face_height = round(height * settings['face_share'] / 100 / 2) * 2
+    duration = clip['duration']
     half = math.floor(duration * FPS / 2) / FPS
     # A one-frame tail has no room for two halves: place its ad before that frame.
-    parts = [(source, start, half, 'source'), (ad, 0, ad['duration'], 'ad'),
-             (source, start + half, duration - half, 'source')]
+    before, after = _split_ranges(clip['ranges'], half)
+    parts = []
+    selected_hook = hook_range(hook, settings)
+    if selected_hook:
+        parts.append((hook, selected_hook[0], selected_hook[1], 'hook'))
+    parts += [(source, start, length, 'source') for start, length in before]
+    parts.append((ad, 0, ad['duration'], 'ad'))
+    parts += [(source, start, length, 'source') for start, length in after]
     parts = [p for p in parts if p[2] > 1e-8]
     args = [binary('ffmpeg'), '-hide_banner', '-nostdin', '-y', '-filter_complex_threads', '2']
     for media, offset, length, kind in parts:
         args += ['-ss', f'{offset:.9f}', '-t', f'{length:.9f}', '-i', media['path']]
     frozen_index = len(parts)
-    freeze_at = start + max(0, half - 1 / FPS)
+    freeze_at = (before[-1][0] + max(0, before[-1][1] - 1 / FPS)) if before else clip['ranges'][0][0]
     args += ['-ss', f'{freeze_at:.9f}', '-i', source['path']]
     if title_path:
         args += ['-loop', '1', '-framerate', str(FPS), '-i', str(title_path)]
@@ -117,12 +205,20 @@ def command(source, ad, settings, start, duration, output, title_path=None):
             f'[c{tag}]{crop_filter(settings["content"], source)},{fit_filter(width, height-face_height, settings["content_mode"])}[ct{tag}]',
             f'[ft{tag}][ct{tag}]vstack=inputs=2,format=yuv420p[base{tag}]'])
     layout(f'[{frozen_index}:v:0]trim=end_frame=1,setpts=PTS-STARTPTS,fps={FPS},tpad=stop_mode=clone:stop_duration={ad["duration"]},trim=duration={ad["duration"]}', 'bg')
+    title_parts = sum(kind != 'hook' for _, _, _, kind in parts)
     if title_path:
-        filters += [f'[{frozen_index+1}:v:0]scale={width}:{height},format=rgba,split={len(parts)}' + ''.join(f'[title{i}]' for i in range(len(parts)))]
+        title_prefix = f'[{frozen_index+1}:v:0]scale={width}:{height},format=rgba'
+        if title_parts == 1:
+            filters += [title_prefix + '[title0]']
+        else:
+            filters += [title_prefix + f',split={title_parts}' + ''.join(f'[title{i}]' for i in range(title_parts))]
+    title_index = 0
     for i, (media, offset, length, kind) in enumerate(parts):
         prefix = f'[{i}:v:0]setpts=PTS-STARTPTS,fps={FPS},tpad=stop_mode=clone:stop_duration=0.1,trim=duration={length:.9f},setsar=1'
         if kind == 'source':
             layout(prefix, str(i))
+        elif kind == 'hook':
+            filters += [prefix + ',' + fit_filter(width, height, settings['hook_mode']) + f'[base{i}]']
         else:
             bw, bh = width // 20 * 18, height // 20 * 6
             banner_filter = (fit_filter(bw, bh, 'crop') if settings['ad_mode'] == 'crop' else
@@ -130,7 +226,11 @@ def command(source, ad, settings, start, duration, output, title_path=None):
             filters += [prefix + ',' + banner_filter + f'[banner{i}]',
                         f'[basebg][banner{i}]overlay=x=\'max(0,min(W-w,W*{settings.get("ad_x", 50)/100}-w/2))\':'
                         f'y=\'max(0,min(H-h,H*{settings.get("ad_y", 72)/100}-h/2))\':shortest=1[base{i}]']
-        filters += [f'[base{i}][title{i}]overlay=shortest=1,format=yuv420p[v{i}]' if title_path else f'[base{i}]null[v{i}]']
+        if title_path and kind != 'hook':
+            filters += [f'[base{i}][title{title_index}]overlay=shortest=1,format=yuv420p[v{i}]']
+            title_index += 1
+        else:
+            filters += [f'[base{i}]null[v{i}]']
         audio = f'[{i}:a:0]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,apad' if media['audio'] else 'anullsrc=r=48000:cl=stereo'
         filters += [audio + f',atrim=duration={length:.9f},asetpts=PTS-STARTPTS[a{i}]']
     filters += [''.join(f'[v{i}][a{i}]' for i in range(len(parts))) + f'concat=n={len(parts)}:v=1:a=1[outv][outa]']
