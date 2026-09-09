@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import secrets
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from engine import ROOT, CREATE_FLAGS, binary, clip_plan, command, hook_range, probe, run, validate_settings
+from engine import ROOT, CREATE_FLAGS, available_encoders, binary, clip_plan, command, hook_range, probe, run, validate_settings
 
 DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
@@ -31,11 +32,15 @@ PICKER_LOCK = threading.Lock()
 FRAME_LOCK = threading.Semaphore(2)
 MEDIA = {}
 JOBS = {}
-DEFAULT = {'settings': validate_settings({}), 'banner_path': '', 'hook_path': '', 'output_dir': str(ROOT / 'exports')}
+DEFAULT = {'settings': validate_settings({}), 'banner_path': '', 'hook_paths': [], 'output_dir': str(ROOT / 'exports')}
 try:
     CONFIG_DATA = {**DEFAULT, **json.loads(CONFIG.read_text(encoding='utf-8'))}
 except (OSError, ValueError):
     CONFIG_DATA = DEFAULT.copy()
+# Migrate the former single bait file without losing it.
+if not CONFIG_DATA.get('hook_paths') and CONFIG_DATA.get('hook_path'):
+    CONFIG_DATA['hook_paths'] = [CONFIG_DATA['hook_path']]
+CONFIG_DATA['hook_paths'] = list(dict.fromkeys(CONFIG_DATA.get('hook_paths') or []))
 
 def save_config():
     with LOCK:
@@ -57,12 +62,29 @@ def register(path):
 def public_job(job):
     return {k:v for k,v in job.items() if not k.startswith('_')}
 
-def render_job(job, source, ad, hook, settings, preview, plan):
+def bait_schedule(hooks, count, rng=None):
+    """Make shuffled bait/skip cycles, avoiding the same bait twice in a row."""
+    if not hooks or count <= 0:
+        return [None] * max(0, count)
+    rng = rng or random.SystemRandom()
+    skips = max(1, round(len(hooks) ** .5))
+    result, previous = [], None
+    while len(result) < count:
+        cycle = list(hooks) + [None] * skips
+        rng.shuffle(cycle)
+        if previous is not None and cycle and cycle[0] is previous:
+            swap = next((i for i, item in enumerate(cycle[1:], 1) if item is not previous), None)
+            if swap is not None:
+                cycle[0], cycle[swap] = cycle[swap], cycle[0]
+        result.extend(cycle)
+        previous = next((item for item in reversed(cycle) if item is not None), previous)
+    return result[:count]
+
+def render_job(job, source, ad, hooks, settings, preview, plan, schedule):
     partial = None
     try:
-        selected_hook = hook_range(hook, settings)
-        hook_duration = selected_hook[1] if selected_hook else 0
-        total_time = sum(item['duration'] + ad['duration'] + hook_duration for item in plan)
+        durations = [(hook_range(hook, settings)[1] if hook else 0) for hook in schedule]
+        total_time = sum(item['duration'] + ad['duration'] + durations[i] for i, item in enumerate(plan))
         elapsed = 0
         for index, clip in enumerate(plan):
             if job['_cancel'].is_set():
@@ -72,6 +94,8 @@ def render_job(job, source, ad, hook, settings, preview, plan):
             dest = Path(job['directory']) / name
             partial = dest.with_suffix('.partial.mp4')
             title_path = Path(job['directory']) / 'title.png'
+            hook = schedule[index]
+            hook_duration = durations[index]
             args = command(source, ad, settings, clip, partial, title_path if title_path.exists() else None, hook)
             with (Path(job['directory']) / 'ffmpeg.log').open('a', encoding='utf-8') as log:
                 process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=log, text=True,
@@ -101,7 +125,8 @@ def render_job(job, source, ad, hook, settings, preview, plan):
             partial = None
             clip_duration = clip['duration'] + ad['duration'] + hook_duration
             elapsed += clip_duration
-            job['files'].append({'name': name, 'url': f'/output/{job["id"]}/{name}', 'duration': clip_duration})
+            job['files'].append({'name': name, 'url': f'/output/{job["id"]}/{name}', 'duration': clip_duration,
+                                 'bait': hook['name'] if hook else None})
         job.update(status='cancelled' if job['_cancel'].is_set() else 'done',
                    stage='Остановлено' if job['_cancel'].is_set() else 'Готово')
         if job['status'] == 'done':
@@ -144,8 +169,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/state':
                 return self.reply(200, {'app': 'cliproom', 'token': TOKEN, 'ffmpeg': bool(binary('ffmpeg') and binary('ffprobe')),
                     'settings': CONFIG_DATA['settings'], 'banner': next((m for m in MEDIA.values() if m['path'] == CONFIG_DATA['banner_path']), None),
-                    'hook': next((m for m in MEDIA.values() if m['path'] == CONFIG_DATA.get('hook_path')), None),
+                    'hooks': [m for path in CONFIG_DATA.get('hook_paths', []) for m in MEDIA.values() if m['path'] == path],
                     'output_dir': CONFIG_DATA['output_dir'], 'jobs': [public_job(j) for j in JOBS.values()]})
+            if path == '/api/encoders':
+                return self.reply(200, {'encoders': available_encoders()})
             if path.startswith('/api/jobs/'):
                 with LOCK:
                     return self.reply(200, public_job(JOBS[path.split('/')[-1]]))
@@ -215,14 +242,26 @@ class Handler(BaseHTTPRequestHandler):
                     PICKER_LOCK.release()
             if self.path == '/api/media':
                 media = register(body['path'])
-                if body.get('role') in ('banner', 'hook'):
+                if body.get('role') == 'banner':
                     with LOCK:
-                        CONFIG_DATA[body['role'] + '_path'] = media['path']
+                        CONFIG_DATA['banner_path'] = media['path']
+                        save_config()
+                elif body.get('role') == 'hook':
+                    with LOCK:
+                        paths = CONFIG_DATA.setdefault('hook_paths', [])
+                        if media['path'] not in paths:
+                            paths.append(media['path'])
                         save_config()
                 return self.reply(200, media)
             if self.path == '/api/hook/clear':
                 with LOCK:
-                    CONFIG_DATA['hook_path'] = ''
+                    media_id = body.get('id')
+                    if media_id:
+                        media = MEDIA.get(media_id)
+                        if media:
+                            CONFIG_DATA['hook_paths'] = [p for p in CONFIG_DATA.get('hook_paths', []) if p != media['path']]
+                    else:
+                        CONFIG_DATA['hook_paths'] = []
                     save_config()
                 return self.reply(200, {'ok': True})
             if self.path == '/api/settings':
@@ -240,11 +279,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {'path': str(folder)})
             if self.path == '/api/render':
                 source, ad = MEDIA[body['source']], MEDIA[body['banner']]
-                hook = MEDIA[body['hook']] if body.get('hook') else None
+                hooks = [MEDIA[key] for key in body.get('hooks', []) if key in MEDIA]
                 settings = validate_settings(body['settings'])
+                # Pool items are prepared clips and are intentionally used in full.
+                settings['hook_start'] = 0
+                settings['hook_end'] = 0
+                if settings['export_encoder'] not in {item['id'] for item in available_encoders()}:
+                    raise ValueError('Выбранный GPU-кодировщик сейчас недоступен. Выберите CPU или обновите драйвер видеокарты.')
                 preview = bool(body.get('preview', False))
                 plan = clip_plan(source, settings, preview)
-                hook_range(hook, settings)
+                for hook in hooks:
+                    hook_range(hook, settings)
+                schedule = bait_schedule(hooks, len(plan))
                 title_png = None
                 if settings['title_top'].strip() or settings['title_bottom'].strip():
                     title_png = base64.b64decode(body.get('title_image', ''), validate=True)
@@ -264,12 +310,15 @@ class Handler(BaseHTTPRequestHandler):
                         raise ValueError('Недостаточно места: освободите хотя бы 300 МБ.')
                     job = {'id': job_id, 'status': 'running', 'progress': 0, 'stage': 'Подготовка', 'files': [],
                            'directory': str(directory), 'preview': preview, 'total': len(plan),
-                           'source_name': source['name'], '_cancel': threading.Event(), '_process': None}
+                           'source_name': source['name'], 'encoder': settings['export_encoder'],
+                           '_cancel': threading.Event(), '_process': None}
                     JOBS[job_id] = job
                     CONFIG_DATA['settings'] = settings
                     save_config()
-                    (directory / 'project.json').write_text(json.dumps({'source': source, 'banner': ad, 'hook': hook, 'settings': settings}, ensure_ascii=False, indent=2), encoding='utf-8')
-                    threading.Thread(target=render_job, args=(job,source,ad,hook,settings,preview,plan), daemon=True).start()
+                    schedule_names = [hook['name'] if hook else None for hook in schedule]
+                    (directory / 'project.json').write_text(json.dumps({'source': source, 'banner': ad, 'hooks': hooks,
+                        'bait_schedule': schedule_names, 'settings': settings}, ensure_ascii=False, indent=2), encoding='utf-8')
+                    threading.Thread(target=render_job, args=(job,source,ad,hooks,settings,preview,plan,schedule), daemon=True).start()
                 return self.reply(200, public_job(job))
             if self.path == '/api/cancel':
                 with LOCK:
@@ -357,11 +406,14 @@ def main():
             register(CONFIG_DATA['banner_path'])
         except Exception:
             pass
-    if CONFIG_DATA.get('hook_path'):
+    valid_hook_paths = []
+    for hook_path in CONFIG_DATA.get('hook_paths', []):
         try:
-            register(CONFIG_DATA['hook_path'])
+            register(hook_path)
+            valid_hook_paths.append(hook_path)
         except Exception:
             pass
+    CONFIG_DATA['hook_paths'] = valid_hook_paths
     try:
         server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
     except OSError:

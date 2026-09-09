@@ -4,11 +4,21 @@ import math
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CREATE_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 FPS = 30
+
+ENCODERS = {
+    'cpu': ('libx264', 'CPU · совместимый'),
+    'nvidia': ('h264_nvenc', 'NVIDIA GPU · NVENC'),
+    'intel': ('h264_qsv', 'Intel GPU · Quick Sync'),
+    'amd': ('h264_amf', 'AMD GPU · AMF'),
+}
+
+ENCODER_PROBE_SIZE = '720x1280'
 
 def binary(name):
     local = ROOT / '.tools' / (name + ('.exe' if os.name == 'nt' else ''))
@@ -16,6 +26,41 @@ def binary(name):
 
 def run(args, **kwargs):
     return subprocess.run(args, creationflags=CREATE_FLAGS, **kwargs)
+
+@lru_cache(maxsize=1)
+def available_encoders():
+    """Return encoders which can initialize on this machine, not merely this FFmpeg build."""
+    result = [{'id': 'cpu', 'name': ENCODERS['cpu'][1], 'hardware': False}]
+    ffmpeg = binary('ffmpeg')
+    if not ffmpeg:
+        return result
+    for encoder_id in ('nvidia', 'intel', 'amd'):
+        codec, name = ENCODERS[encoder_id]
+        try:
+            test = run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin',
+                        '-f', 'lavfi', '-i', f'color=c=black:s={ENCODER_PROBE_SIZE}:r={FPS}:d=0.1',
+                        '-frames:v', '2', '-an', '-pix_fmt', 'yuv420p',
+                        *_video_encoder_args(encoder_id, 'veryfast'), '-f', 'null', '-'],
+                       capture_output=True, timeout=30)
+            if test.returncode == 0:
+                result.append({'id': encoder_id, 'name': name, 'hardware': True})
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return result
+
+def _video_encoder_args(encoder, preset):
+    """Translate the common speed control to arguments supported by each encoder."""
+    if encoder == 'nvidia':
+        return ['-c:v', 'h264_nvenc', '-preset', {'ultrafast':'p1', 'veryfast':'p4', 'fast':'p5'}[preset],
+                '-rc', 'vbr', '-cq', '23', '-b:v', '0']
+    if encoder == 'intel':
+        return ['-c:v', 'h264_qsv', '-preset', {'ultrafast':'veryfast', 'veryfast':'faster', 'fast':'fast'}[preset],
+                '-global_quality', '23']
+    if encoder == 'amd':
+        return ['-c:v', 'h264_amf', '-quality', {'ultrafast':'speed', 'veryfast':'balanced', 'fast':'quality'}[preset],
+                '-rc', 'cqp', '-qp_i', '23', '-qp_p', '23', '-qp_b', '25']
+    return ['-c:v', 'libx264', '-preset', preset, '-crf', '23',
+            '-threads', str(max(1, min(8, (os.cpu_count() or 4) - 1)))]
 
 def probe(path):
     if not binary('ffprobe'):
@@ -41,11 +86,15 @@ def probe(path):
 
 def validate_settings(raw):
     result = {'resolution': str(raw.get('resolution', '720')), 'preset': raw.get('preset', 'veryfast'),
+              'export_encoder': raw.get('export_encoder', 'cpu'),
+              'media_playback': bool(raw.get('media_playback', False)),
               'face_share': float(raw.get('face_share', 35)), 'face_mode': raw.get('face_mode', 'crop'),
               'content_mode': raw.get('content_mode', 'fit'), 'ad_mode': raw.get('ad_mode', 'fit'),
               'hook_mode': raw.get('hook_mode', 'crop')}
     if result['resolution'] not in ('720', '1080') or result['preset'] not in ('ultrafast', 'veryfast', 'fast'):
         raise ValueError('Неизвестный формат экспорта.')
+    if result['export_encoder'] not in ENCODERS:
+        raise ValueError('Неизвестный кодировщик видео.')
     if not math.isfinite(result['face_share']) or not 20 <= result['face_share'] <= 60:
         raise ValueError('Высота вебки должна быть от 20 до 60%.')
     for key in ('face_mode', 'content_mode', 'ad_mode', 'hook_mode'):
@@ -234,8 +283,8 @@ def command(source, ad, settings, clip, output, title_path=None, hook=None):
         audio = f'[{i}:a:0]aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,apad' if media['audio'] else 'anullsrc=r=48000:cl=stereo'
         filters += [audio + f',atrim=duration={length:.9f},asetpts=PTS-STARTPTS[a{i}]']
     filters += [''.join(f'[v{i}][a{i}]' for i in range(len(parts))) + f'concat=n={len(parts)}:v=1:a=1[outv][outa]']
-    args += ['-filter_complex', ';'.join(filters), '-map', '[outv]', '-map', '[outa]',
-             '-c:v', 'libx264', '-preset', settings['preset'], '-crf', '23', '-pix_fmt', 'yuv420p', '-r', str(FPS),
-             '-threads', str(max(1, min(8, (os.cpu_count() or 4) - 1))), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+    video_args = _video_encoder_args(settings.get('export_encoder', 'cpu'), settings['preset'])
+    args += ['-filter_complex', ';'.join(filters), '-map', '[outv]', '-map', '[outa]'] + video_args + [
+             '-pix_fmt', 'yuv420p', '-r', str(FPS), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
              '-movflags', '+faststart', '-map_metadata', '-1', '-progress', 'pipe:1', '-nostats', str(output)]
     return args

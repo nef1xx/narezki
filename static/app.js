@@ -1,7 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const state = {token:'',source:null,hook:null,banner:null,settings:{},selected:'face',image:null,job:null,busy:false,frameRequest:0};
+const state = {token:'',source:null,hooks:[],banner:null,settings:{},selected:'face',image:null,job:null,busy:false,frameRequest:0};
 let saveTimer, seekTimer, pollTimer;
+let playerRole = null;
 const sourceCanvas = $('source-canvas'), sourceCtx = sourceCanvas.getContext('2d');
 const previewCanvas = $('preview-canvas'), previewCtx = previewCanvas.getContext('2d');
 const clock = n => { n = Math.max(0, Math.floor(n || 0)); return `${String(Math.floor(n/60)).padStart(2,'0')}:${String(n%60).padStart(2,'0')}`; };
@@ -17,11 +18,34 @@ async function api(path, data) {
 function guarded(fn) { return async (...args) => { try { error(''); await fn(...args); } catch(e) { error(e.message); } }; }
 function syncControls() {
   for(const key of ['resolution','preset','face_share','face_mode','content_mode','ad_mode','hook_mode']) $(key.replaceAll('_','-')).value = state.settings[key];
+  $('media-playback').checked=!!state.settings.media_playback;
   $('face-share-value').textContent = `${state.settings.face_share}%`;
   for(const key of ['title_top','title_bottom','title_size','title_y']) $(key.replaceAll('_','-')).value = state.settings[key];
   $('title-size-value').textContent=`${state.settings.title_size} px`;
   $('title-y-value').textContent=`${state.settings.title_y}%`;
-  syncCoordinates(); syncBannerPosition(); syncTimeControls(); draw();
+  syncCoordinates(); syncBannerPosition(); syncTimeControls(); syncPlaybackUi(); draw();
+}
+function syncPlaybackUi() {
+  for(const role of ['source','banner']) $('play-'+role).hidden=!state.settings.media_playback||!state[role];
+  $('play-hook').hidden=!state.settings.media_playback||!state.hooks.length;
+}
+async function loadEncoders() {
+  try {
+    const data=await api('/api/encoders');
+    const select=$('export-encoder');select.replaceChildren();
+    for(const encoder of data.encoders) {
+      const option=document.createElement('option');option.value=encoder.id;option.textContent=encoder.name;select.append(option);
+    }
+    const available=data.encoders.some(encoder=>encoder.id===state.settings.export_encoder);
+    if(!available)state.settings.export_encoder='cpu';
+    select.value=state.settings.export_encoder;
+    const gpuCount=data.encoders.filter(encoder=>encoder.hardware).length;
+    $('encoder-help').textContent=gpuCount?'GPU-кодировщик обычно быстрее; CPU даёт максимальную совместимость.':'Совместимый GPU-кодировщик не найден — доступен CPU.';
+    if(!available)scheduleSave();
+  } catch(e) {
+    $('encoder-help').textContent='Не удалось проверить GPU — используется CPU.';
+    state.settings.export_encoder='cpu';$('export-encoder').value='cpu';
+  }
 }
 function scheduleSave() {
   clearTimeout(saveTimer);
@@ -40,10 +64,7 @@ function editedSourceDuration() {
   return Math.max(0,duration);
 }
 function editedHookDuration() {
-  if(!state.hook)return 0;
-  const start=Math.max(0,Math.min(state.hook.duration,Number(state.settings.hook_start)||0));
-  const end=Math.max(start,Math.min(state.hook.duration,Number(state.settings.hook_end)||state.hook.duration));
-  return Math.max(0,end-start);
+  return state.hooks.length?Math.max(...state.hooks.map(hook=>hook.duration)):0;
 }
 function syncTimeControls() {
   const source=state.source;
@@ -70,17 +91,8 @@ function syncTimeControls() {
     $('cut-start-value').textContent=timecode(cutStart);$('cut-end-value').textContent=timecode(cutEnd);
     $('edited-duration').textContent=`Останется ${seconds(editedSourceDuration())}`;
   } else $('edited-duration').textContent='Сначала выберите исходник';
-  const hook=state.hook;
-  $('hook-trim-fields').disabled=!hook;$('hook-trim-empty').hidden=!!hook;$('hook-trim-controls').hidden=!hook;$('clear-hook').hidden=!hook;
-  if(hook) {
-    const minGap=Math.min(.1,hook.duration);
-    let start=Math.max(0,Math.min(hook.duration-minGap,Number(state.settings.hook_start)||0));
-    let end=Number(state.settings.hook_end)||hook.duration;
-    end=Math.max(start+minGap,Math.min(hook.duration,end));
-    state.settings.hook_start=start;state.settings.hook_end=end;
-    $('hook-start').max=hook.duration;$('hook-end').max=hook.duration;$('hook-start').value=start;$('hook-end').value=end;
-    $('hook-start-value').textContent=timecode(start);$('hook-end-value').textContent=timecode(end);
-  }
+  $('hook-trim-fields').disabled=!state.hooks.length;$('hook-trim-empty').hidden=!!state.hooks.length;
+  $('hook-trim-controls').hidden=!state.hooks.length;$('clear-hook').hidden=!state.hooks.length;
 }
 function syncCoordinates() {
   const rect = state.settings[state.selected]; if(!rect) return;
@@ -90,7 +102,7 @@ function syncCoordinates() {
   $('select-content').setAttribute('aria-pressed',state.selected==='content');
 }
 function updateReady() {
-  const ready = state.source && state.banner && editedSourceDuration()>=1/30 && (!state.hook||editedHookDuration()>=1/30) && !state.busy;
+  const ready = state.source && state.banner && editedSourceDuration()>=1/30 && !state.busy;
   $('export').disabled = !ready; $('preview-button').disabled = !ready;
   if(state.source) {
     const edited=editedSourceDuration();
@@ -100,14 +112,32 @@ function updateReady() {
   if(state.banner) {
     $('ad-length').textContent = seconds(state.banner.duration);
   }
-  const hookDuration=editedHookDuration();
-  $('timeline-hook').hidden=!state.hook;
-  if(state.hook)$('hook-length').textContent=seconds(hookDuration);
+  const hookDuration=editedHookDuration(),hookCount=state.hooks.length;
+  $('timeline-hook').hidden=!hookCount;
+  if(hookCount)$('hook-length').textContent=`${hookCount} в пуле · иногда пропуск`;
   const total=60+(state.banner?.duration||0)+hookDuration;
   $('timeline-total').textContent=`До ${seconds(total)} на клип`;
-  $('preview-summary').textContent=`Проба: ${state.hook?seconds(hookDuration)+' bait + ':''}3 сек. + баннер + 3 сек.`;
+  $('preview-summary').textContent=`Проба: ${hookCount?'случайный bait или пропуск + ':''}3 сек. + баннер + 3 сек.`;
+}
+function renderHooks() {
+  const list=$('hook-list');list.replaceChildren();
+  for(const hook of state.hooks) {
+    const row=document.createElement('div');row.className='hook-pool-item';
+    const label=document.createElement('span');label.textContent=`${hook.name} · ${seconds(hook.duration)}`;label.title=hook.path;
+    const remove=document.createElement('button');remove.type='button';remove.className='text-button danger';remove.textContent='Убрать';
+    remove.addEventListener('click',guarded(async()=>{await api('/api/hook/clear',{id:hook.id});state.hooks=state.hooks.filter(item=>item.id!==hook.id);renderHooks();syncTimeControls();syncPlaybackUi();updateReady();}));
+    row.append(label,remove);list.append(row);
+  }
+  $('hook-name').textContent=state.hooks.length?`${state.hooks.length} bait-видео в пуле`:'';
+  $('hook-name').hidden=!state.hooks.length;
+  $('hook-meta').textContent=state.hooks.length?'Случайно чередуются, часть клипов — без bait':'Добавьте несколько заранее обрезанных видео';
+  $('pick-hook').textContent=state.hooks.length?'Добавить ещё':'Добавить bait';
 }
 function mediaInfo(role, info, preserveTiming=false) {
+  if(role==='hook') {
+    if(!state.hooks.some(item=>item.id===info.id))state.hooks.push(info);
+    state.settings.hook_start=0;state.settings.hook_end=0;renderHooks();syncTimeControls();syncPlaybackUi();updateReady();return;
+  }
   state[role] = info;
   $(role+'-name').textContent = info.name; $(role+'-name').title = info.path; $(role+'-name').hidden = false;
   $(role+'-meta').textContent = `${clock(info.duration)} · ${info.width} × ${info.height}${info.audio?'':' · без звука'}`;
@@ -119,10 +149,9 @@ function mediaInfo(role, info, preserveTiming=false) {
     $('source-duration').textContent = clock(info.duration);
     loadFrame(0);
   }
-  if(role==='hook'&&!preserveTiming){state.settings.hook_start=0;state.settings.hook_end=info.duration;}
-  syncTimeControls();
+  syncTimeControls();syncPlaybackUi();
   draw(); updateReady();
-  if(!preserveTiming&&['source','hook'].includes(role))scheduleSave();
+  if(!preserveTiming&&role==='source')scheduleSave();
 }
 async function choose(role) {
   const button = $('pick-'+role); button.disabled = true;
@@ -276,7 +305,12 @@ for(const key of ['x','y','w','h']) $('rect-'+key).addEventListener('change',()=
   if(!rect.every(Number.isFinite)||Math.min(rect[0],rect[1])<0||Math.min(rect[2],rect[3])<.01||rect[0]+rect[2]>1.000001||rect[1]+rect[3]>1.000001){error('Область должна оставаться внутри кадра. X + ширина и Y + высота — не больше 100%.');syncCoordinates();return;}
   error('');state.settings[state.selected]=rect;draw();scheduleSave();
 });
-for(const key of ['resolution','preset','face_share','face_mode','content_mode','ad_mode','hook_mode']) $(key.replaceAll('_','-')).addEventListener('input',e=>{state.settings[key]=key==='face_share'?Number(e.target.value):e.target.value;$('face-share-value').textContent=`${state.settings.face_share}%`;draw();updateReady();scheduleSave();});
+for(const key of ['resolution','preset','export_encoder','face_share','face_mode','content_mode','ad_mode','hook_mode']) $(key.replaceAll('_','-')).addEventListener('input',e=>{state.settings[key]=key==='face_share'?Number(e.target.value):e.target.value;$('face-share-value').textContent=`${state.settings.face_share}%`;draw();updateReady();scheduleSave();});
+$('media-playback').addEventListener('change',e=>{
+  state.settings.media_playback=e.target.checked;syncPlaybackUi();
+  if(!e.target.checked&&playerRole)$('player-dialog').close();
+  scheduleSave();
+});
 $('seek').addEventListener('input',e=>{const at=+e.target.value;$('frame-time').textContent=clock(at);clearTimeout(seekTimer);seekTimer=setTimeout(()=>loadFrame(at),250);});
 for(const key of ['title_top','title_bottom','title_size','title_y']) $(key.replaceAll('_','-')).addEventListener('input',e=>{
   state.settings[key]=['title_size','title_y'].includes(key)?Number(e.target.value):e.target.value;
@@ -288,33 +322,44 @@ $('cut-enabled').addEventListener('change',e=>{
   if(e.target.checked&&state.source){const start=state.settings.source_start,end=state.settings.source_end,span=end-start;state.settings.cut_start=start+span*.4;state.settings.cut_end=start+span*.6;}
   syncTimeControls();updateReady();scheduleSave();
 });
-for(const key of ['source_start','source_end','cut_start','cut_end','hook_start','hook_end']) $(key.replaceAll('_','-')).addEventListener('input',e=>{
-  const media=key.startsWith('hook_')?state.hook:state.source;
+for(const key of ['source_start','source_end','cut_start','cut_end']) $(key.replaceAll('_','-')).addEventListener('input',e=>{
+  const media=state.source;
   let value=Number(e.target.value),gap=Math.min(.1,media?.duration||.1);
   if(key==='source_start')value=Math.min(value,state.settings.source_end-gap);
   if(key==='source_end')value=Math.max(value,state.settings.source_start+gap);
   if(key==='cut_start')value=Math.min(value,state.settings.cut_end-gap);
   if(key==='cut_end')value=Math.max(value,state.settings.cut_start+gap);
-  if(key==='hook_start')value=Math.min(value,state.settings.hook_end-gap);
-  if(key==='hook_end')value=Math.max(value,state.settings.hook_start+gap);
   state.settings[key]=Math.max(0,value);syncTimeControls();updateReady();scheduleSave();
 });
 $('clear-hook').addEventListener('click',guarded(async()=>{
-  await api('/api/hook/clear',{});state.hook=null;state.settings.hook_start=0;state.settings.hook_end=0;
-  $('hook-name').hidden=true;$('hook-name').textContent='';$('hook-meta').textContent='Короткая затравка перед каждым клипом';$('pick-hook').textContent='Выбрать bait';
-  syncTimeControls();updateReady();scheduleSave();
+  await api('/api/hook/clear',{});state.hooks=[];renderHooks();syncTimeControls();syncPlaybackUi();updateReady();
 }));
 $('choose-output').addEventListener('click',guarded(async()=>{const {path}=await api('/api/pick',{kind:'directory'});if(path){const result=await api('/api/output-dir',{path});$('output-path').textContent=result.path;}}));
 async function startRender(preview) {
   state.busy=true;updateReady();
-  try {const job=await api('/api/render',{source:state.source.id,hook:state.hook?.id||null,banner:state.banner.id,settings:state.settings,title_image:titleCanvas().toDataURL('image/png').split(',')[1],preview});state.job=job;renderJob(job);$('job-panel').scrollIntoView({behavior:'smooth',block:'nearest'});poll();}
+  try {const job=await api('/api/render',{source:state.source.id,hooks:state.hooks.map(hook=>hook.id),banner:state.banner.id,settings:state.settings,title_image:titleCanvas().toDataURL('image/png').split(',')[1],preview});state.job=job;renderJob(job);$('job-panel').scrollIntoView({behavior:'smooth',block:'nearest'});poll();}
   catch(e){state.busy=false;updateReady();throw e;}
 }
 $('export').addEventListener('click',guarded(()=>startRender(false)));
 $('preview-button').addEventListener('click',guarded(()=>startRender(true)));
-function play(url) {$('result-player').src=url;$('player-dialog').showModal();$('result-player').play().catch(()=>{});}
+function openPlayer(url,title,meta='',role=null,startAt=0) {
+  const video=$('result-player');playerRole=role;$('player-title').textContent=title;$('player-meta').textContent=meta;
+  video.src=url;video.playbackRate=Number($('playback-rate').value)||1;
+  video.onloadedmetadata=()=>{if(startAt>0)video.currentTime=Math.min(startAt,Math.max(0,video.duration-.05));video.play().catch(()=>{});};
+  $('player-dialog').showModal();video.load();
+}
+function play(url,name='Готовый ролик') {openPlayer(url,'Проверка результата',name);}
+function playMedia(role) {
+  const media=role==='hook'?state.hooks.at(-1):state[role];if(!media||!state.settings.media_playback)return;
+  const titles={source:'Исходное видео',hook:'Последний добавленный bait',banner:'Рекламный баннер'};
+  const startAt=role==='source'?Number($('seek').value)||0:0;
+  openPlayer(`/media/${media.id}`,titles[role],`${media.name} · ${clock(media.duration)}`,role,startAt);
+}
+for(const role of ['source','hook','banner']) $('play-'+role).addEventListener('click',()=>playMedia(role));
+$('playback-rate').addEventListener('change',e=>$('result-player').playbackRate=Number(e.target.value)||1);
+$('result-player').addEventListener('error',()=>{if(playerRole)$('player-meta').textContent='Этот формат не воспроизводится браузером напрямую. Экспорт при этом остаётся доступен.';});
 $('close-player').addEventListener('click',()=>$('player-dialog').close());
-$('player-dialog').addEventListener('close',()=>{$('result-player').pause();$('result-player').removeAttribute('src');$('result-player').load();});
+$('player-dialog').addEventListener('close',()=>{const video=$('result-player'),role=playerRole,at=video.currentTime;video.pause();video.onloadedmetadata=null;video.removeAttribute('src');video.load();playerRole=null;if(role==='source'&&Number.isFinite(at)){const target=Math.min(at,Number($('seek').max)||at);$('seek').value=target;loadFrame(target);}});
 function renderJob(job) {
   state.job=job;$('job-panel').hidden=false;$('job-title').textContent=job.preview?'Пробный ролик':'Экспорт клипов';
   $('job-stage').textContent=job.stage;$('job-percent').textContent=`${job.progress}%`;$('progress').value=job.progress;
@@ -323,7 +368,7 @@ function renderJob(job) {
   const results=$('results');results.replaceChildren();
   for(const file of job.files) {
     const row=document.createElement('div');row.className='result-item';
-    const button=document.createElement('button');button.textContent=`▷ ${file.name}`;button.addEventListener('click',()=>play(file.url));
+    const button=document.createElement('button');button.textContent=`▷ ${file.name}${file.bait?' · '+file.bait:' · без bait'}`;button.addEventListener('click',()=>play(file.url,file.name));
     const link=document.createElement('a');link.href=file.url;link.download=file.name;link.textContent='Скачать ↓';
     row.append(button,link);results.append(row);
   }
@@ -336,7 +381,7 @@ async function poll() {
 $('cancel').addEventListener('click',guarded(async()=>{await api('/api/cancel',{id:state.job.id});$('cancel').disabled=true;$('job-stage').textContent='Останавливаем…';}));
 $('open-output').addEventListener('click',guarded(()=>api('/api/open-folder',{id:state.job.id})));
 async function init() {
-  const data=await api('/api/state');state.token=data.token;state.settings={title_top:'',title_bottom:'',title_size:72,title_y:35,ad_x:50,ad_y:72,hook_mode:'crop',source_start:0,source_end:0,cut_enabled:false,cut_start:0,cut_end:0,hook_start:0,hook_end:0,...data.settings};syncControls();
+  const data=await api('/api/state');state.token=data.token;state.settings={title_top:'',title_bottom:'',title_size:72,title_y:35,ad_x:50,ad_y:72,hook_mode:'crop',export_encoder:'cpu',media_playback:false,source_start:0,source_end:0,cut_enabled:false,cut_start:0,cut_end:0,hook_start:0,hook_end:0,...data.settings};syncControls();loadEncoders();
   $('output-path').textContent=data.output_dir;$('engine-status').textContent=data.ffmpeg?'FFmpeg готов · H.264 / AAC':'Ожидаем установку FFmpeg…';
   if(!data.ffmpeg) {
     const waitForEngine=setInterval(async()=>{
@@ -344,7 +389,7 @@ async function init() {
     },5000);
   }
   if(data.banner)mediaInfo('banner',data.banner);
-  if(data.hook)mediaInfo('hook',data.hook,true);
+  state.hooks=data.hooks||[];renderHooks();syncTimeControls();syncPlaybackUi();updateReady();
   const job=data.jobs.find(j=>j.status==='running')||data.jobs.at(-1);
   if(job){renderJob(job);if(job.status==='running'){state.busy=true;poll();}}
   updateReady();
